@@ -2,6 +2,8 @@
 Auto Farm + Auto Crate - MM2 | FINAL BUILD v4 (Halloween '26)
 - Скорость 20 studs/sec (постоянная)
 - АВТО-КЕЙСЫ: отдельный поток, ремоуты ищутся лениво (не блокируют скрипт)
+    v4.2: попытка открытия строго раз в CrateRetrySeconds (30 сек) — без логики
+    "ждём деньги": пытаемся ВСЕГДА, решает сервер; спам "не хватает валюты" убран
     🎃 НОВОЕ: Halloween2026Box — 600 Candies2026 ИЛИ 1 HalloweenKey2026
     (имена подтверждены дампом игры: Remotes.Shop.OpenCrate [RemoteFunction],
      Remotes.Shop.BoxController [BindableEvent])
@@ -94,6 +96,11 @@ local SETTINGS = {
     HalloweenCurrencies = { "Candies2026", "HalloweenKey2026" },
     -- ^ порядок траты: СНАЧАЛА конфеты (их фармится много), потом ключ (их мало).
     --   Поменяй местами, если хочешь сначала тратить ключи.
+
+    -- ПО ЗАПРОСУ: попытка открытия кейса строго раз в N секунд — без логики
+    -- "ждём деньги". Скрипт пытается открыть ВСЕГДА, даже если сам считает,
+    -- что валюты нет (решение принимает сервер).
+    CrateRetrySeconds = 30,
 }
 
 -- ❗ ВПИШИ ссылку на скрипт, иначе после перезахода запускать вручную
@@ -763,6 +770,7 @@ task.spawn(function()
     end
 
     local function openBox(box)
+        local lastErr = nil
         for _, currency in ipairs(box.currencies) do
             local ok, result = pcall(function()
                 return OpenCrate:InvokeServer(box.id, "MysteryBox", currency)
@@ -773,31 +781,31 @@ task.spawn(function()
                     fireBoxController({ { MysteryBoxId = box.id, RewardedItemId = result } })
                 end)
                 print("✅ [CRATE]", box.id, "|", currency, "| Выпало:", tostring(result))
-                return true
+                return true, nil
+            elseif not ok then
+                lastErr = tostring(result) -- текст ошибки InvokeServer
             end
         end
-        return false
+        return false, lastErr or "сервер отклонил все валюты (нет денег/ключа)"
     end
 
-    local openedCount, failedCount, waitingForMoney = 0, 0, false
+    -- РЕЖИМ ПО ЗАПРОСУ: тупо пытаемся открыть кейс каждые CrateRetrySeconds сек.
+    -- Никакой логики "ждём деньги" и сообщений о нехватке валюты раз в 5 сек:
+    -- одна попытка → пауза → снова. Решение о списании принимает СЕРВЕР,
+    -- а не скрипт, поэтому пытаемся всегда.
+    local openedCount, failedCount = 0, 0
     while SETTINGS.Enabled do
         local box = boxes[math.random(1, #boxes)]
-        if openBox(box) then
-            if waitingForMoney then
-                print("💰 [CRATE] Деньги появились!")
-                waitingForMoney = false
-            end
+        local ok, why = openBox(box)
+        if ok then
             openedCount = openedCount + 1
-            print("📦 [CRATE] Открыто: " .. openedCount .. " | Ошибок: " .. failedCount)
-            task.wait(2.5)
+            print("📦 [CRATE] Открыто: " .. openedCount .. " | Неудачных попыток: " .. failedCount)
         else
-            if not waitingForMoney then
-                print("⏳ [CRATE] Не хватает валюты (конфет: " .. getCandies() .. "). Ожидаю...")
-                waitingForMoney = true
-            end
             failedCount = failedCount + 1
-            task.wait(5)
+            print("⏳ [CRATE] Попытка " .. failedCount .. " не удалась (" .. tostring(why)
+                .. "). Пробую снова через " .. SETTINGS.CrateRetrySeconds .. " сек.")
         end
+        task.wait(SETTINGS.CrateRetrySeconds)
     end
 end)
 
@@ -839,6 +847,7 @@ task.spawn(function()
         print("   🎃 Хеллоуин-кейс: Halloween2026Box (валюты: "
             .. table.concat(SETTINGS.HalloweenCurrencies, " → ") .. ")")
     end
+    print("   📦 Кейсы: попытка каждые " .. SETTINGS.CrateRetrySeconds .. " сек (независимо от баланса)")
     print("   🔌 Реконнект при ошибках: " .. table.concat(codes, ", ") .. " | ретрай: " .. SETTINGS.ReconnectRetry .. " сек")
     print("")
 
