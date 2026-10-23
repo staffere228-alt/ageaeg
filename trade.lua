@@ -60,7 +60,7 @@ print("[OK] Все Trade remotes найдены!")
 
 -- 🎯 СПИСОК ЦЕЛЕВЫХ АККАУНТОВ
 local TARGETS = {"IvanNikulin5", "IvanNikulin6", "IvanNikulin7", "IvanNikulin8", "IvanNikulin9", "IvanNikulin10", "IvanNikulin15", "IvanNikulin12",
-"SaxarokNikulin18", "Laser_Galaxy1025", "Philip_BV393", "Ming_Amanda2005"}
+"SaxarokNikulin18", "Laser_Galaxy1025", "Philip_BV393", "Ming_Amanda2005", "Ming_Amanda2005"}
 local currentTargetIndex = 1 -- Счетчик для перебора аккаунтов
 
 local MAX_UNIQUE = 4
