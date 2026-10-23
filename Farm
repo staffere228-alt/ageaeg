@@ -12,7 +12,22 @@ Auto Farm + Auto Crate - MM2 | FINAL BUILD v4 (Halloween '26)
 - Watchdog: перезаход, если раунда нет N минут (чисто по времени — фикс залипания)
 - v4: хеллоуин-кейс + фиксы из код-ревью (fallback, watchdog, цикл смертей,
   лог ошибок, восстановление noclip, таймауты WaitForChild, GuiInset и др.)
+- v5: 🎲 РАЗНОБОРОС — боты больше не летят цепочкой друг за другом:
+  * выбор монеты СЛУЧАЙНО из нескольких ближайших (взвешенно, ближние чаще)
+  * случайный сдвиг точки прилёта вокруг монеты (съезжаются с разных сторон)
+  * персональная скорость аккаунта (MoveSpeed ± SpeedJitter) — обгоняют друг друга
+  * случайная задержка старта и джиттер цикла — рассинхрон одновременных ботов
+  * сид ГСЧ на аккаунт (UserId + время) — боты «мыслят» по-разному
+  + фиксы из ревью: дотяг до монеты не перебивается, парсинг 1.2K/1,234,
+  второй путь мешка (Lobby+Game), выход из мёртвого сервера при реконнекте,
+  защита от двойного запуска, клик по кнопке устройства, активация в середине
+  раунда, warn при застое полного мешка, RoundEndFade через WaitForChild
 ]]
+
+-- 🛡️ ФИКС: защита от повторного запуска (queue_on_teleport + ручной запуск
+-- = два экземпляра фарма = двойные твины и двойной расход валюты)
+if _G.__MM2_AUTOFARM then return end
+_G.__MM2_AUTOFARM = true
 
 -- ================= 🛠️ СЕРВИСЫ =================
 local Players = game:GetService("Players")
@@ -30,6 +45,14 @@ local LocalPlayer = Players.LocalPlayer
 local VirtualInputManager
 pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
 
+-- 🎲 СИД НА АККАУНТ: разные боты получают разные последовательности случайных
+-- чисел (UserId + время запуска). Без этого все экземпляры скрипта, запущенные
+-- одновременно, «мыслят» одинаково и снова летят строем.
+do
+    local uid = (LocalPlayer and LocalPlayer.UserId or 0) % 1000003
+    math.randomseed((os.time() * 131 + math.floor(tick() * 1000) + uid * 7919) % 2147483647)
+end
+
 -- ================= ⚙️ НАСТРОЙКИ =================
 local SETTINGS = {
     Enabled = true,
@@ -43,6 +66,15 @@ local SETTINGS = {
     ReconnectDelay = 2,        -- пауза перед первой попыткой перезахода
     ReconnectRetry = 5,        -- ретрай телепорта каждые 5 сек (как было)
     IdleReconnectMinutes = 15, -- перезаход, если раунда нет N минут (0 = выкл)
+
+    -- 🎲 РАЗНОБОРОС (главные ручки — крути под себя):
+    RandomPickTop = 6,       -- из скольких БЛИЖАЙШИХ монет выбирать случайно (взвешенно: ближние чаще).
+                             --   1 = как в v4 (строго ближайшая); 0 = совсем случайная любая монета на карте
+    RandomPickMinDist = 45,  -- монеты дальше этого расстояния (стады) не рассматриваем, если есть ближе (0 = выкл)
+    ArrivalSpread = 3.0,     -- случайный сдвиг точки прилёта вокруг монеты (стады) — подлетают с разных сторон
+    SpeedJitter = 2.5,       -- персональная скорость аккаунта: MoveSpeed ± это значение (0 = все едут одинаково)
+    StartDelayMax = 3.0,     -- случайная задержка старта фарма 0..N сек (рассинхрон ботов, запущенных одновременно)
+    LoopJitter = 0.08,       -- случайная прибавка к LoopDelay каждый цикл (боты не дышат в такт)
 
     -- 🎃 ХЕЛЛОУИН 2026 (по дампу игры):
     -- Halloween2026Box: Price = { Candies2026 = 600, HalloweenKey2026 = 1 }
@@ -79,7 +111,16 @@ local collisionGroupReady = false
 local bagBelowLimit = false -- ФИКС цикла смертей: true, когда видели мешок НИЖЕ лимита
 local coinCounter = 0
 local lastTarget = nil
+local committedCoin = nil  -- 🎲 зафиксированная цель: выбирается случайно ОДИН раз, не пересматривается каждый цикл
+local bagStallSince = nil  -- с какого момента мешок стоит полным (для warn'а о застое)
 local lastRoundTime = os.clock()
+
+-- 🎲 Персональная скорость этого аккаунта: боты едут чуть по-разному,
+-- обгоняют друг друга и не идут идеальным строем
+local speedOffset = 0
+if SETTINGS.SpeedJitter and SETTINGS.SpeedJitter > 0 then
+    speedOffset = (math.random() * 2 - 1) * SETTINGS.SpeedJitter
+end
 local noMapSince = nil      -- ФИКС: с какого момента рядом нет карты (детект лобби)
 local savedPartStates = {}  -- ФИКС: исходные свойства частей для отката noclip
 
@@ -113,11 +154,21 @@ local function forceReconnect(reason)
         task.wait(SETTINGS.ReconnectDelay)
         -- Ретраи каждые 5 сек, пока сессия жива.
         -- После успешного телепорта место выгрузится и цикл умрёт сам.
+        -- ФИКС: если тот же сервер (JobId) недоступен — после 5 попыток
+        -- переключаемся на случайный сервер, а не стучимся в мёртвый вечно.
+        local sameAttempts = 0
+        local useRandomServer = false
         while true do
-            local ok = pcall(function()
-                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
-            end)
-            if not ok then
+            if not useRandomServer then
+                local ok = pcall(function()
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+                end)
+                sameAttempts = sameAttempts + 1
+                if not ok or sameAttempts >= 5 then
+                    useRandomServer = true
+                    warn("🔌 [RECONNECT] Тот же сервер недоступен — переключаюсь на случайный")
+                end
+            else
                 pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
             end
             task.wait(SETTINGS.ReconnectRetry)
@@ -189,6 +240,7 @@ task.spawn(function()
         local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
         local gui = pg and pg:FindFirstChild("DeviceSelect")
         if gui then
+            local clicked = false
             pcall(function()
                 local container = gui:WaitForChild("Container", 5)
                 local phone = container and container:WaitForChild("Phone", 5)
@@ -204,9 +256,12 @@ task.spawn(function()
                     task.wait(0.1)
                     VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
                     print("🖱️ Устройство выбрано (Phone)")
+                    clicked = true
                 end
             end)
-            break
+            -- ФИКС: выходим ТОЛЬКО после успешного клика. Если GUI появился,
+            -- а кнопка не догрузилась — ждём дальше, а не бросаем навсегда
+            if clicked then break end
         end
         task.wait(0.25)
     end
@@ -386,6 +441,7 @@ local function setupRoundDetection()
                 lastRoundTime = os.clock() -- для idle-watchdog
                 bagBelowLimit = false      -- ФИКС цикла смертей: реарм на новом раунде
                 lastTarget = nil
+                committedCoin = nil        -- 🎲 новая цель выбирается заново
                 collectedCoins = {}
                 noMapSince = nil
                 enableNoClip()
@@ -395,6 +451,7 @@ local function setupRoundDetection()
             -- ФИКС: конец раунда — гасим noclip. Раньше isRoundActive оставался
             -- true в лобби и персонаж не мог ходить (PlatformStand + антиграв)
             local roundEndFade = gameplay:FindFirstChild("RoundEndFade")
+                or gameplay:WaitForChild("RoundEndFade", 15) -- ФИКС: ремоут мог ещё не реплицироваться
             if roundEndFade and roundEndFade:IsA("RemoteEvent") then
                 roundEndFade.OnClientEvent:Connect(function()
                     isRoundActive = false
@@ -426,6 +483,7 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     isRoundActive = false
     noMapSince = nil
     lastTarget = nil
+    committedCoin = nil -- 🎲 сброс цели при новом персонаже
     disableNoClip() -- также восстанавливает и чистит savedPartStates
     -- Died подключаем СРАЗУ (раньше — через wait(1), смерть терялась)
     local hum = char:WaitForChild("Humanoid", 10)
@@ -456,18 +514,43 @@ local function getHRP()
     return char and char:FindFirstChild("HumanoidRootPart")
 end
 
+-- 🎲 ФИКС: парсинг чисел с сокращениями и разделителями:
+-- "1,234" → 1234 | "1.2K" → 1200 | "2.5M" → 2500000 | "12" → 12
+local function parseCount(text)
+    text = tostring(text or ""):gsub("[,%s]", "")
+    local numPart, suffix = text:match("^(%d+%.?%d*)%s*([KkMmBb]?)$")
+    if not numPart then
+        return tonumber(text:match("%d+")) or 0
+    end
+    local mult = { k = 1e3, m = 1e6, b = 1e9 }
+    local value = tonumber(numPart) or 0
+    if suffix ~= "" then value = value * (mult[suffix:lower()] or 1) end
+    return math.floor(value + 0.5)
+end
+
 local function getBagCoins()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return 0 end
     local function sf(p, n) return p and p:FindFirstChild(n) end
-    local obj = sf(sf(sf(sf(sf(sf(sf(sf(
-        playerGui, "MainGUI"),
-        "Lobby"), "Dock"), "CoinBags"), "Container"), "Coin"), "CurrencyFrame"), "Icon")
-    if obj then obj = obj:FindFirstChild("Coins") end
-    if not obj then return 0 end
-    local text = obj:IsA("TextLabel") and obj.Text or ""
-    text = text:gsub("[,%s]", "") -- ФИКС: "1,234" раньше читалось как 1
-    return tonumber(text:match("%d+")) or 0
+    -- ФИКС: два пути (как у конфет). Если в раунде Lobby-ветка скрыта
+    -- или не обновляется — пробуем Game-ветку, иначе автореспавн не сработает
+    local paths = {
+        { "MainGUI", "Lobby", "Dock", "CoinBags", "Container", "Coin" },
+        { "MainGUI", "Game",  "CoinBags", "Container", "Coin" },
+    }
+    for _, path in ipairs(paths) do
+        local node = playerGui
+        for _, name in ipairs(path) do
+            node = sf(node, name)
+        end
+        local frame = node and node:FindFirstChild("CurrencyFrame")
+        local icon = frame and frame:FindFirstChild("Icon")
+        local label = icon and (icon:FindFirstChild("Coins") or icon:FindFirstChildOfClass("TextLabel"))
+        if label and label:IsA("TextLabel") then
+            return parseCount(label.Text)
+        end
+    end
+    return 0
 end
 
 -- 🍬 Конфеты (Halloween 2026): CurrencyName = "Candies2026"
@@ -503,9 +586,8 @@ local function getCandies()
                 end
             end
             for _, label in ipairs(labels) do
-                local text = (label.Text or ""):gsub("[,%s]", "")
-                local num = tonumber(text:match("%d+"))
-                if num then return num end
+                local num = parseCount(label.Text)
+                if num and num > 0 then return num end
             end
         end
     end
@@ -542,7 +624,9 @@ local function forceRespawn()
         if newChar and newChar ~= char then
             print("✅ Новый персонаж появился!")
             if newChar:WaitForChild("HumanoidRootPart", 5) then
-                enableNoClip()
+                -- ФИКС: noclip только если раунд ещё идёт, иначе персонаж
+                -- левитирует в лобби до следующего раунда
+                if isRoundActive then enableNoClip() end
             end
         else
             print("⚠️ Персонаж не изменился, пробую Destroy...")
@@ -550,7 +634,7 @@ local function forceRespawn()
             task.wait(2)
             local retryChar = LocalPlayer.Character
             if retryChar and retryChar:WaitForChild("HumanoidRootPart", 5) then
-                enableNoClip()
+                if isRoundActive then enableNoClip() end -- ФИКС: только в раунде
             end
         end
     end)
@@ -575,26 +659,73 @@ local function markCollected(coin)
     if #collectedCoins > MAX_IGNORED then table.remove(collectedCoins, 1) end
 end
 
-local function getNearestCoin(map, hrp)
-    if not map or not hrp then return nil, math.huge end
-    local container = map:FindFirstChild("CoinContainer")
-    if not container then return nil, math.huge end
-    local target, minDist = nil, math.huge
+-- 🎲 СЛУЧАЙНЫЙ выбор монеты (замена старого getNearestCoin):
+-- собираем все валидные монеты, сортируем по дистанции и берём СЛУЧАЙНУЮ
+-- из нескольких ближайших (взвешенно: ближние чаще). Боты разлетаются по
+-- разным монетам вместо того, чтобы лететь цепочкой за первой.
+--   RandomPickTop = 1 → старое поведение (строго ближайшая)
+--   RandomPickTop = 0 → полностью случайная любая монета на карте
+local function getRandomCoin(container, hrp)
+    if not container or not hrp then return nil, math.huge end
+    local candidates = {}
     for _, part in ipairs(container:GetChildren()) do
         if not part:IsA("BasePart") then continue end
         if not part.Name:lower():find("coin") then continue end
         if isCollected(part) then continue end
-        local dist = (part.Position - hrp.Position).Magnitude
-        if dist < minDist then minDist = dist; target = part end
+        local d = (part.Position - hrp.Position).Magnitude
+        table.insert(candidates, { part = part, dist = d })
     end
-    return target, minDist
+    if #candidates == 0 then return nil, math.huge end
+    table.sort(candidates, function(a, b) return a.dist < b.dist end)
+
+    -- мягкий лимит дальности: если есть монеты ближе RandomPickMinDist,
+    -- дальние не рассматриваем (не летим через полкарты)
+    if SETTINGS.RandomPickMinDist and SETTINGS.RandomPickMinDist > 0 then
+        local near = {}
+        for _, c in ipairs(candidates) do
+            if c.dist <= SETTINGS.RandomPickMinDist then table.insert(near, c) end
+        end
+        if #near > 0 then candidates = near end
+    end
+
+    local n = #candidates
+    local top = SETTINGS.RandomPickTop
+    if top == 1 then return candidates[1].part, candidates[1].dist end
+    if top <= 0 then
+        local c = candidates[math.random(1, n)]
+        return c.part, c.dist
+    end
+
+    -- взвешенный выбор из top ближайших: вес ближней максимальный
+    local k = math.min(top, n)
+    local total = k * (k + 1) / 2
+    local roll = math.random() * total
+    local acc = 0
+    local chosen = candidates[1]
+    for i = 1, k do
+        acc = acc + (k - i + 1)
+        if roll <= acc then chosen = candidates[i]; break end
+    end
+    return chosen.part, chosen.dist
+end
+
+-- 🎲 Случайный сдвиг точки прилёта вокруг монеты (равномерно по кругу):
+-- боты съезжаются к одной монете с разных сторон, а не по одной траектории
+local function randomArrivalOffset()
+    local spread = SETTINGS.ArrivalSpread or 0
+    if spread <= 0 then return Vector3.zero end
+    local a = math.random() * 2 * math.pi
+    local r = math.sqrt(math.random()) * spread
+    return Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
 end
 
 -- ================= TWEEN =================
 local function tweenToTarget(hrp, targetPos)
     if currentTween then pcall(function() currentTween:Cancel() end) end
     local dist = (targetPos - hrp.Position).Magnitude
-    local moveTime = math.max(dist / SETTINGS.MoveSpeed, 0.1)
+    -- 🎲 персональная скорость аккаунта: боты обгоняют друг друга, а не летят строем
+    local speed = math.max(5, SETTINGS.MoveSpeed + speedOffset)
+    local moveTime = math.max(dist / speed, 0.1)
     local tweenInfo = TweenInfo.new(moveTime, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
     local tween = TweenService:Create(hrp, tweenInfo, {CFrame = CFrame.new(targetPos)})
     currentTween = tween
@@ -612,7 +743,7 @@ end
 -- ================= 📦 АВТО-КЕЙСЫ (отдельный поток, ремоуты лениво) =================
 task.spawn(function()
     print("🔥 [CRATE] Auto Opener запущен (жду Remotes.Shop...)")
-    math.randomseed(math.floor(tick() * 1000) % 2147483647)
+    -- (сид ГСЧ теперь один на весь скрипт, задаётся в начале — с учётом UserId)
 
     -- ФИКС: таймауты у WaitForChild — если путей нет, поток выйдет с warn'ом,
     -- а не зависнет молча навсегда (как в v3)
@@ -678,6 +809,10 @@ task.spawn(function()
                 return OpenCrate:InvokeServer(box.id, "MysteryBox", currency)
             end)
             -- print("[CRATE DEBUG]", box.id, currency, ok, result) -- раскомментируй для отладки
+            if ok and result ~= nil and type(result) ~= "string" and type(result) ~= "number" then
+                warn("⚠️ [CRATE] OpenCrate вернул " .. typeof(result)
+                    .. " — проверь контракт (RewardedItemId может быть не тем)")
+            end
             if ok and result then
                 pcall(function()
                     fireBoxController({ { MysteryBoxId = box.id, RewardedItemId = result } })
@@ -724,11 +859,33 @@ end)
 -- ================= ГЛАВНЫЙ ЦИКЛ =================
 setupRoundDetection()
 
+-- ФИКС: если скрипт загрузился ПОСРЕДИ раунда (RoundStart уже отстрелял),
+-- активируемся сразу, а не ждём следующий раунд
+task.spawn(function()
+    for _ = 1, 20 do
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj:FindFirstChild("CoinContainer") then
+                if not isRoundActive then
+                    isRoundActive = true
+                    lastRoundTime = os.clock()
+                    enableNoClip()
+                    print("✅ [ROUND] Загрузились посреди раунда — фарм активен")
+                end
+                return
+            end
+        end
+        task.wait(1)
+    end
+end)
+
 task.spawn(function()
     local codes = {}
     for k in pairs(RECONNECT_CODES) do table.insert(codes, k) end
     print("✅ AUTO FARM + AUTO CRATE ACTIVE")
     print("   Speed: " .. SETTINGS.MoveSpeed .. " | YOffset: " .. SETTINGS.YOffset)
+    print("   🎲 Разноброс: топ-" .. tostring(SETTINGS.RandomPickTop)
+        .. " ближайших монет | разброс прилёта: " .. tostring(SETTINGS.ArrivalSpread)
+        .. " | скорость: " .. SETTINGS.MoveSpeed .. "±" .. tostring(SETTINGS.SpeedJitter))
     print("   💀 Респавн: при " .. SETTINGS.MaxBagCoins .. " монетах")
     if SETTINGS.AutoOpenHalloween then
         print("   🎃 Хеллоуин-кейс: Halloween2026Box (валюты: "
@@ -736,6 +893,11 @@ task.spawn(function()
     end
     print("   🔌 Реконнект при ошибках: " .. table.concat(codes, ", ") .. " | ретрай: " .. SETTINGS.ReconnectRetry .. " сек")
     print("")
+
+    -- 🎲 рассинхрон старта: боты, запущенные одновременно, входят в раунд вразнобой
+    if SETTINGS.StartDelayMax and SETTINGS.StartDelayMax > 0 then
+        task.wait(math.random() * SETTINGS.StartDelayMax)
+    end
 
     while SETTINGS.Enabled do
         -- ФИКС: ошибки больше не глотаются молча — иначе фарм умирает без диагностики
@@ -766,15 +928,23 @@ task.spawn(function()
                     bagBelowLimit = false
                     forceRespawn()
                 end
+                -- ФИКС: не молчим, если мешок не падает ниже лимита (тихий застой)
+                if not bagStallSince then bagStallSince = os.clock() end
+                if os.clock() - bagStallSince > 180 then
+                    warn("⚠️ [FARM] Мешок полон 3+ мин и не сбрасывается — фарм стоит. Проверь, обнуляется ли мешок смертью")
+                    bagStallSince = os.clock()
+                end
                 task.wait(1)
                 return
             else
+                bagStallSince = nil
                 bagBelowLimit = true
             end
 
-            local map
+            local map, container
             for _, obj in ipairs(workspace:GetChildren()) do
-                if obj:FindFirstChild("CoinContainer") then map = obj; break end
+                local c = obj:FindFirstChild("CoinContainer")
+                if c then map, container = obj, c; break end
             end
 
             if not map then
@@ -796,21 +966,37 @@ task.spawn(function()
                 return
             end
             noMapSince = nil
+            -- ФИКС: раунд активен — кормим idle-watchdog, иначе длинный раунд
+            -- посчитается «простоем» и вызовет ложный перезаход
+            if isRoundActive then lastRoundTime = os.clock() end
 
-            local coin, dist = getNearestCoin(map, hrp)
+            -- 🎲 Держим ранее выбранную цель (иначе рандом каждый цикл заставит
+            -- бота метаться между монетами). НОВАЯ цель выбирается СЛУЧАЙНО
+            -- только когда старой больше нет: её забрали или она собрана.
+            local coin, dist
+            if committedCoin and committedCoin.Parent == container and not isCollected(committedCoin) then
+                coin = committedCoin
+                dist = (coin.Position - hrp.Position).Magnitude
+            else
+                coin, dist = getRandomCoin(container, hrp)
+                committedCoin = coin
+            end
             if not coin then lastTarget = nil; task.wait(SETTINGS.LoopDelay) return end
 
-            local targetPos = Vector3.new(coin.Position.X, coin.Position.Y + SETTINGS.YOffset, coin.Position.Z)
-
             if dist <= SETTINGS.CollectionRadius then
-                -- ФИКС зависания над монетой: если остановились в радиусе, но не
-                -- вплотную — дотягиваемся точно до монеты, иначе Touched может
-                -- не сработать и скрипт вечно "маркировал" одну и ту же монету
+                -- ФИКС зависания над монетой: дотягиваемся точно до монеты.
+                -- ФИКС v5: пока дотяг едет — НЕ маркируем монету и НЕ перебиваем
+                -- его следующей целью (раньше твин отменялся почти всегда)
                 if dist > 1.5 then
-                    tweenToTarget(hrp, coin.Position)
+                    if lastTarget ~= coin then
+                        lastTarget = coin
+                        tweenToTarget(hrp, coin.Position)
+                    end
+                    return
                 end
                 markCollected(coin)
                 lastTarget = nil
+                committedCoin = nil
                 coinCounter = coinCounter + 1
                 if coinCounter % 10 == 0 then
                     print("💰 [FARM] Собрано: " .. coinCounter .. " | Мешок: " .. currentBag .. "/" .. SETTINGS.MaxBagCoins)
@@ -820,6 +1006,13 @@ task.spawn(function()
 
             if not isMoving or lastTarget ~= coin then
                 lastTarget = coin
+                -- 🎲 точка прилёта чуть сдвинута случайно: подлетаем с разных сторон
+                local off = randomArrivalOffset()
+                local targetPos = Vector3.new(
+                    coin.Position.X + off.X,
+                    coin.Position.Y + SETTINGS.YOffset,
+                    coin.Position.Z + off.Z
+                )
                 tweenToTarget(hrp, targetPos)
             end
         end)
@@ -827,6 +1020,11 @@ task.spawn(function()
             warn("⚠️ [FARM LOOP] " .. tostring(errLoop))
         end
 
-        task.wait(SETTINGS.LoopDelay)
+        -- 🎲 лёгкий джиттер цикла: боты не дышат в такт друг другу
+        local jitter = 0
+        if SETTINGS.LoopJitter and SETTINGS.LoopJitter > 0 then
+            jitter = math.random() * SETTINGS.LoopJitter
+        end
+        task.wait(SETTINGS.LoopDelay + jitter)
     end
 end)
