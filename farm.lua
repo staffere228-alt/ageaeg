@@ -12,9 +12,18 @@ Auto Farm + Auto Crate - MM2 | FINAL BUILD v4 (Halloween '26)
 - Watchdog: перезаход, если раунда нет N минут (чисто по времени — фикс залипания)
 - v4: хеллоуин-кейс + фиксы из код-ревью (fallback, watchdog, цикл смертей,
   лог ошибок, восстановление noclip, таймауты WaitForChild, GuiInset и др.)
+- v4.1 (DELTA X FIX): теперь работает и на телефонах:
+    • ждёт загрузку игры и LocalPlayer (Delta X часто выполняет авто-execute
+      ещё ДО входа в игру — раньше всё падало с "attempt to index nil")
+    • ВСЕ необязательные сервисы (VirtualUser/VirtualInputManager) — через pcall
+    • клик по GUI кроссплатформенный: getconnections → VIM → VirtualUser
+      (на Delta X тачскрин и VIM-клики не работают — стреляем обработчики напрямую)
+    • анти-АФК: проверка VirtualUser + хук LocalPlayer.Idled
+    • очередь телепорта: + getgenv().queue_on_teleport
+    • печать информации об экзекьюторе (для диагностики на телефоне)
 ]]
 
--- ================= 🛠️ СЕРВИСЫ =================
+-- ================= 🛠️ СЕРВИСЫ (Xeno / Delta X / мобильные) =================
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local TeleportService = game:GetService("TeleportService")
@@ -22,13 +31,48 @@ local GuiService = game:GetService("GuiService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PhysicsService = game:GetService("PhysicsService")
 local RunService = game:GetService("RunService")
-local VirtualUser = game:GetService("VirtualUser")
-local LocalPlayer = Players.LocalPlayer
 
--- ФИКС: VirtualInputManager есть не во всех экзекьюторах. Раньше GetService без
--- pcall мог уронить ВЕСЬ скрипт на первой строке. Теперь просто отключится авто-клик.
+-- ФИКС DELTA: ВСЕ необязательные сервисы — только через pcall.
+-- На мобильных экзекьюторах VirtualUser/VirtualInputManager могут отсутствовать
+-- или быть заблокированы, и обычный GetService уронил бы ВЕСЬ скрипт на 1-й строке.
+local VirtualUser
+pcall(function() VirtualUser = game:GetService("VirtualUser") end)
 local VirtualInputManager
 pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
+
+-- ФИКС DELTA (авто-execute): на телефонах скрипт часто запускается ещё ДО входа
+-- в игру. Без ожидания LocalPlayer всё падало с "attempt to index nil".
+if not game:IsLoaded() then
+    print("⏳ [MM2] Жду загрузку игры...")
+    local loaded = false
+    local conn
+    pcall(function()
+        conn = game.Loaded:Connect(function() loaded = true end)
+    end)
+    local t0 = os.clock()
+    while not loaded and os.clock() - t0 < 120 do task.wait(0.5) end
+    if conn then pcall(function() conn:Disconnect() end) end
+end
+
+local LocalPlayer = Players.LocalPlayer
+local lpT0 = os.clock()
+while not LocalPlayer and os.clock() - lpT0 < 30 do
+    task.wait(0.25)
+    LocalPlayer = Players.LocalPlayer
+end
+if not LocalPlayer then
+    error("[MM2] LocalPlayer не найден — зайди в игру и запусти скрипт ещё раз")
+end
+
+-- Инфо об экзекьюторе — видно в консоли, что доступно на телефоне
+local EXECUTOR = "unknown"
+pcall(function()
+    if type(identifyexecutor) == "function" then EXECUTOR = tostring(identifyexecutor()) end
+end)
+print("📟 [MM2] Экзекьютор: " .. EXECUTOR
+    .. " | getconnections: " .. tostring(type(getconnections) == "function")
+    .. " | VIM: " .. tostring(VirtualInputManager ~= nil)
+    .. " | VirtualUser: " .. tostring(VirtualUser ~= nil))
 
 -- ================= ⚙️ НАСТРОЙКИ =================
 local SETTINGS = {
@@ -89,6 +133,11 @@ local function getQueueFn()
     if syn and type(syn.queue_on_teleport) == "function" then return syn.queue_on_teleport end
     if fluxus and type(fluxus.queue_on_teleport) == "function" then return fluxus.queue_on_teleport end
     if Delta and type(Delta.queue_on_teleport) == "function" then return Delta.queue_on_teleport end
+    -- ФИКС DELTA: у некоторых сборок функция живёт только в getgenv()
+    if type(getgenv) == "function" then
+        local ok, g = pcall(getgenv)
+        if ok and g and type(g.queue_on_teleport) == "function" then return g.queue_on_teleport end
+    end
     return nil
 end
 
@@ -176,14 +225,62 @@ task.spawn(function()
         end
     end
 end)
--- ================= 🖱️ ВЫБОР УСТРОЙСТВА =================
+-- ================= 🖱️ ВЫБОР УСТРОЙСТВА (кросс-платформенно) =================
+-- ФИКС DELTA: раньше клик делался ТОЛЬКО через VirtualInputManager, которого
+-- на телефонах нет (или его клики не работают). Из-за этого окно выбора
+-- устройства оставалось неоткрытым/неотвеченным на Delta X.
+-- Кросс-платформенный клик по кнопке GUI (по порядку):
+--   1) getconnections — стреляем обработчики напрямую (работает и на Xeno, и на Delta X)
+--   2) VirtualInputManager — обычный клик по координатам (только PC)
+--   3) VirtualUser — запасной вариант
+local function clickGuiButton(button)
+    if not button or not button:IsA("GuiButton") then return false end
+
+    if type(getconnections) == "function" then
+        local fired = false
+        pcall(function()
+            for _, sig in ipairs({ button.Activated, button.MouseButton1Click, button.MouseButton1Down }) do
+                local okC, conns = pcall(getconnections, sig)
+                if okC and type(conns) == "table" then
+                    for _, conn in ipairs(conns) do
+                        if pcall(function() conn:Fire() end) then fired = true end
+                    end
+                end
+            end
+        end)
+        if fired then return true end
+    end
+
+    if VirtualInputManager then
+        local ok = pcall(function()
+            local bp, bs = button.AbsolutePosition, button.AbsoluteSize
+            -- ФИКС: AbsolutePosition не включает GuiInset (топбар ~36px),
+            -- из-за этого клик мог уходить выше кнопки
+            local inset = GuiService:GetGuiInset()
+            local x = bp.X + bs.X / 2 + inset.X
+            local y = bp.Y + bs.Y / 2 + inset.Y
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.1)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+        if ok then return true end
+    end
+
+    if VirtualUser then
+        local ok = pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton1(Vector2.new())
+        end)
+        if ok then return true end
+    end
+
+    warn("⚠️ [CLICK] Клик по GUI не удался — нет доступных способов")
+    return false
+end
+
 -- ФИКС: top-level task.wait(10) УДАЛЁН — он 10 секунд блокировал старт всего
 -- скрипта (CharacterAdded, раунды, кейсы). Поток и так сам ждёт GUI до 60 сек.
 task.spawn(function()
-    if not VirtualInputManager then
-        warn("⚠️ [DEVICE] VirtualInputManager недоступен — авто-выбор устройства пропущен")
-        return
-    end
     local deadline = os.clock() + 60
     while os.clock() < deadline do
         local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -194,16 +291,9 @@ task.spawn(function()
                 local phone = container and container:WaitForChild("Phone", 5)
                 local button = phone and phone:WaitForChild("Button", 5)
                 if button then
-                    local bp, bs = button.AbsolutePosition, button.AbsoluteSize
-                    -- ФИКС: AbsolutePosition не включает GuiInset (топбар ~36px),
-                    -- из-за этого клик мог уходить выше кнопки
-                    local inset = GuiService:GetGuiInset()
-                    local x = bp.X + bs.X / 2 + inset.X
-                    local y = bp.Y + bs.Y / 2 + inset.Y
-                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
-                    task.wait(0.1)
-                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
-                    print("🖱️ Устройство выбрано (Phone)")
+                    if clickGuiButton(button) then
+                        print("🖱️ Устройство выбрано (Phone)")
+                    end
                 end
             end)
             break
@@ -712,14 +802,29 @@ task.spawn(function()
 end)
 
 -- ================= 🛡️ ANTI-AFK =================
-task.spawn(function()
-    while task.wait(120) do
-        pcall(function()
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new(math.random(100, 800), math.random(100, 600)))
+-- ФИКС DELTA: VirtualUser на некоторых экзекьюторах недоступен — раньше
+-- pcall молча глотал ошибку каждые 120 сек. Теперь плюс ко всему
+-- подключаем LocalPlayer.Idled (надёжный анти-АФК на мобильных).
+if VirtualUser then
+    pcall(function()
+        LocalPlayer.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(math.random(100, 800), math.random(100, 600)))
+            end)
         end)
-    end
-end)
+    end)
+    task.spawn(function()
+        while task.wait(120) do
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(math.random(100, 800), math.random(100, 600)))
+            end)
+        end
+    end)
+else
+    warn("⚠️ [AFK] VirtualUser недоступен — анти-АФК отключён")
+end
 
 -- ================= ГЛАВНЫЙ ЦИКЛ =================
 setupRoundDetection()
