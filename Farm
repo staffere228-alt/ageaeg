@@ -1,17 +1,20 @@
 --[[
-Auto Farm + Auto Crate - MM2 | FINAL BUILD v3
+Auto Farm + Auto Crate - MM2 | FINAL BUILD v4 (Halloween '26)
 - Скорость 20 studs/sec (постоянная)
 - АВТО-КЕЙСЫ: отдельный поток, ремоуты ищутся лениво (не блокируют скрипт)
-- РЕСПАВН: Health=0 + ChangeState(Dead) + защита от цикла смертей
-- ПУТЬ К МОНЕТАМ: MainGUI.Lobby.Dock.CoinBags...
-- NoClip ULTIMATE + Антигравитация (оптимизировано)
+    🎃 НОВОЕ: Halloween2026Box — 600 Candies2026 ИЛИ 1 HalloweenKey2026
+    (имена подтверждены дампом игры: Remotes.Shop.OpenCrate [RemoteFunction],
+     Remotes.Shop.BoxController [BindableEvent])
+- РЕСПАВН: Health=0 + ChangeState(Dead) + защита от цикла смертей (bagBelowLimit)
+- ПУТЬ К МОНЕТАМ: MainGUI.Lobby.Dock.CoinBags... (конфеты: MainGUI.Game.CoinBags.Container.Candy)
+- NoClip ULTIMATE + Антигравитация (сила считается от workspace.Gravity)
 - РЕКОННЕКТ при ошибке 279 (+ 277/268/267) с ретраями каждые 5 сек
-- Watchdog: перезаход, если раунд не стартовал N минут
+- Watchdog: перезаход, если раунда нет N минут (чисто по времени — фикс залипания)
+- v4: хеллоуин-кейс + фиксы из код-ревью (fallback, watchdog, цикл смертей,
+  лог ошибок, восстановление noclip, таймауты WaitForChild, GuiInset и др.)
 ]]
 
 -- ================= 🛠️ СЕРВИСЫ =================
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local TeleportService = game:GetService("TeleportService")
@@ -19,7 +22,13 @@ local GuiService = game:GetService("GuiService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local PhysicsService = game:GetService("PhysicsService")
 local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
 local LocalPlayer = Players.LocalPlayer
+
+-- ФИКС: VirtualInputManager есть не во всех экзекьюторах. Раньше GetService без
+-- pcall мог уронить ВЕСЬ скрипт на первой строке. Теперь просто отключится авто-клик.
+local VirtualInputManager
+pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
 
 -- ================= ⚙️ НАСТРОЙКИ =================
 local SETTINGS = {
@@ -34,6 +43,13 @@ local SETTINGS = {
     ReconnectDelay = 2,        -- пауза перед первой попыткой перезахода
     ReconnectRetry = 5,        -- ретрай телепорта каждые 5 сек (как было)
     IdleReconnectMinutes = 15, -- перезаход, если раунда нет N минут (0 = выкл)
+
+    -- 🎃 ХЕЛЛОУИН 2026 (по дампу игры):
+    -- Halloween2026Box: Price = { Candies2026 = 600, HalloweenKey2026 = 1 }
+    AutoOpenHalloween = true,  -- открывать хеллоуин-кейс вместе с обычными
+    HalloweenCurrencies = { "Candies2026", "HalloweenKey2026" },
+    -- ^ порядок траты: СНАЧАЛА конфеты (их фармится много), потом ключ (их мало).
+    --   Поменяй местами, если хочешь сначала тратить ключи.
 }
 
 -- ❗ ВПИШИ ссылку на скрипт, иначе после перезахода запускать вручную
@@ -52,8 +68,7 @@ local IGNORE_DUR = 3.0
 local isReconnecting = false
 local isRespawning = false
 
--- ================= 🔄 СОСТОЯНИЕ (объявлено раньше, чтобы рек.
--- watchdog видел эти переменные) =================
+-- ================= 🔄 СОСТОЯНИЕ =================
 local isRoundActive = false
 local collectedCoins = {}
 local currentTween = nil
@@ -61,10 +76,12 @@ local isMoving = false
 local noclipActive = false
 local antiGravForce = nil
 local collisionGroupReady = false
-local bagHandled = false     -- защита от бесконечного цикла смертей
+local bagBelowLimit = false -- ФИКС цикла смертей: true, когда видели мешок НИЖЕ лимита
 local coinCounter = 0
 local lastTarget = nil
 local lastRoundTime = os.clock()
+local noMapSince = nil      -- ФИКС: с какого момента рядом нет карты (детект лобби)
+local savedPartStates = {}  -- ФИКС: исходные свойства частей для отката noclip
 
 -- ================= 🔌 РЕКОННЕКТ (в т.ч. ошибка 279) =================
 local function getQueueFn()
@@ -146,18 +163,27 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- Watchdog: перезаход, если долго висим без раунда
+-- ФИКС: раньше условие "not isRoundActive" залипало в true после конца раунда
+-- (isRoundActive сбрасывался только при смерти/респавне) и watchdog никогда
+-- не срабатывал именно тогда, когда был нужен. Теперь смотрим ТОЛЬКО время
+-- с последнего RoundStart/конца раунда.
 task.spawn(function()
     if (SETTINGS.IdleReconnectMinutes or 0) <= 0 then return end
     while not isReconnecting do
         task.wait(10)
-        if not isRoundActive and (os.clock() - lastRoundTime) > SETTINGS.IdleReconnectMinutes * 60 then
+        if (os.clock() - lastRoundTime) > SETTINGS.IdleReconnectMinutes * 60 then
             forceReconnect("Idle: раунда нет дольше " .. SETTINGS.IdleReconnectMinutes .. " мин")
         end
     end
 end)
-
 -- ================= 🖱️ ВЫБОР УСТРОЙСТВА =================
+-- ФИКС: top-level task.wait(10) УДАЛЁН — он 10 секунд блокировал старт всего
+-- скрипта (CharacterAdded, раунды, кейсы). Поток и так сам ждёт GUI до 60 сек.
 task.spawn(function()
+    if not VirtualInputManager then
+        warn("⚠️ [DEVICE] VirtualInputManager недоступен — авто-выбор устройства пропущен")
+        return
+    end
     local deadline = os.clock() + 60
     while os.clock() < deadline do
         local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
@@ -169,9 +195,14 @@ task.spawn(function()
                 local button = phone and phone:WaitForChild("Button", 5)
                 if button then
                     local bp, bs = button.AbsolutePosition, button.AbsoluteSize
-                    VirtualInputManager:SendMouseButtonEvent(bp.X + bs.X/2, bp.Y + bs.Y/2, 0, true, game, 1)
+                    -- ФИКС: AbsolutePosition не включает GuiInset (топбар ~36px),
+                    -- из-за этого клик мог уходить выше кнопки
+                    local inset = GuiService:GetGuiInset()
+                    local x = bp.X + bs.X / 2 + inset.X
+                    local y = bp.Y + bs.Y / 2 + inset.Y
+                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
                     task.wait(0.1)
-                    VirtualInputManager:SendMouseButtonEvent(bp.X + bs.X/2, bp.Y + bs.Y/2, 0, false, game, 1)
+                    VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
                     print("🖱️ Устройство выбрано (Phone)")
                 end
             end)
@@ -180,7 +211,6 @@ task.spawn(function()
         task.wait(0.25)
     end
 end)
-task.wait(10)
 
 -- ================= 🚫 NOCLIP ULTIMATE + АНТИГРАВИТАЦИЯ =================
 local STATES_TO_BLOCK = {
@@ -202,7 +232,8 @@ local function setupAntiGravity(hrp)
     local vf = Instance.new("VectorForce")
     vf.Name = "AntiGravity"
     vf.Attachment0 = att
-    vf.Force = Vector3.new(0, hrp.AssemblyMass * 196.2, 0)
+    -- ФИКС: сила от workspace.Gravity, а не хардкод 196.2 (в игре может быть другая гравитация)
+    vf.Force = Vector3.new(0, hrp.AssemblyMass * workspace.Gravity, 0)
     vf.RelativeTo = Enum.ActuatorRelativeTo.World
     vf.ApplyAtCenterOfMass = true
     vf.Parent = hrp
@@ -216,10 +247,21 @@ local function removeAntiGravity()
     end
 end
 
+local function isGroupRegistered(name)
+    local ok, res = pcall(function()
+        return PhysicsService:CollisionGroupIsRegistered(name)
+    end)
+    return ok and res == true
+end
+
 local function ensureCollisionGroup() -- регистрация ОДИН раз (раньше — каждый Heartbeat)
     if collisionGroupReady then return end
     pcall(function()
-        PhysicsService:RegisterCollisionGroup("UltimateNC")
+        -- ФИКС: если группа уже зарегистрирована, повторный RegisterCollisionGroup
+        -- кинул бы ошибку и collisionGroupReady никогда не ставился в true
+        if not isGroupRegistered("UltimateNC") then
+            PhysicsService:RegisterCollisionGroup("UltimateNC")
+        end
         PhysicsService:CollisionGroupSetCollidable("UltimateNC", "Default", false)
         collisionGroupReady = true
     end)
@@ -238,6 +280,15 @@ local function applyUltimateNoClip(character)
     end
     for _, part in ipairs(character:GetDescendants()) do
         if part:IsA("BasePart") then
+            -- ФИКС: запоминаем ИСХОДНЫЕ свойства, чтобы disableNoClip
+            -- возвращал их, а не ставил всем CanCollide=true / Massless=false
+            if not savedPartStates[part] then
+                savedPartStates[part] = {
+                    cc = part.CanCollide,
+                    m = part.Massless,
+                    cg = part.CollisionGroup,
+                }
+            end
             part.CanCollide = false
             part.Massless = true
             pcall(function() part.CollisionGroup = "UltimateNC" end)
@@ -260,22 +311,29 @@ local function disableNoClip()
     isMoving = false
     removeAntiGravity()
     local char = LocalPlayer.Character
-    if not char then return end
+    if not char then
+        savedPartStates = {}
+        return
+    end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if hum then
         hum.PlatformStand = false
-        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        -- ФИКС: сначала разблокируем стейты, ПОТОМ ChangeState(GettingUp) —
+        -- раньше GettingUp был ещё заблокирован и ChangeState игнорировался
         for _, state in ipairs(STATES_TO_BLOCK) do
             pcall(function() hum:SetStateEnabled(state, true) end)
         end
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
     end
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") then
-            part.CanCollide = true
-            part.Massless = false
-            pcall(function() part.CollisionGroup = "Default" end)
+    -- ФИКС: восстановление исходных свойств частей (включая CollisionGroup)
+    for part, st in pairs(savedPartStates) do
+        if part and part.Parent then
+            part.CanCollide = st.cc
+            part.Massless = st.m
+            pcall(function() part.CollisionGroup = st.cg end)
         end
     end
+    savedPartStates = {}
 end
 
 -- Лёгкий per-frame цикл: только удержание состояния
@@ -291,6 +349,9 @@ RunService.Heartbeat:Connect(function()
         end
         for _, part in ipairs(char:GetDescendants()) do
             if part:IsA("BasePart") and part.CanCollide then
+                if not savedPartStates[part] then
+                    savedPartStates[part] = { cc = true, m = part.Massless, cg = part.CollisionGroup }
+                end
                 part.CanCollide = false
                 pcall(function() part.CollisionGroup = "UltimateNC" end)
             end
@@ -301,7 +362,7 @@ RunService.Heartbeat:Connect(function()
                 setupAntiGravity(hrp)
             end
             if antiGravForce then
-                antiGravForce.Force = Vector3.new(0, hrp.AssemblyMass * 196.2, 0)
+                antiGravForce.Force = Vector3.new(0, hrp.AssemblyMass * workspace.Gravity, 0)
             end
         end
     end)
@@ -310,37 +371,52 @@ end)
 -- ================= 📡 ОБНАРУЖЕНИЕ РАУНДА =================
 local function setupRoundDetection()
     task.spawn(function()
-        local connected = false
-        for _ = 1, 10 do -- до ~30 сек попыток
+        local gameplay, roundStart
+        for _ = 1, 10 do -- до ~30 сек попыток (по дампу: Remotes.Gameplay.RoundStart)
             local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-            local gameplay = remotes and remotes:FindFirstChild("Gameplay")
-            local roundStart = gameplay and gameplay:FindFirstChild("RoundStart")
-            if roundStart and roundStart:IsA("RemoteEvent") then
-                roundStart.OnClientEvent:Connect(function()
-                    isRoundActive = true
-                    lastRoundTime = os.clock() -- для idle-watchdog
-                    bagHandled = false
-                    lastTarget = nil
-                    collectedCoins = {}
-                    enableNoClip()
-                end)
-                connected = true
-                print("✅ [ROUND] RoundStart подключён")
-                break
-            end
+            gameplay = remotes and remotes:FindFirstChild("Gameplay")
+            roundStart = gameplay and gameplay:FindFirstChild("RoundStart")
+            if roundStart and roundStart:IsA("RemoteEvent") then break end
             task.wait(3)
         end
-        if not connected then
-            print("⚠️ [ROUND] RoundStart не найден — fallback-режим")
-            while not isRoundActive do
+
+        if roundStart and roundStart:IsA("RemoteEvent") then
+            roundStart.OnClientEvent:Connect(function()
+                isRoundActive = true
+                lastRoundTime = os.clock() -- для idle-watchdog
+                bagBelowLimit = false      -- ФИКС цикла смертей: реарм на новом раунде
+                lastTarget = nil
+                collectedCoins = {}
+                noMapSince = nil
+                enableNoClip()
+            end)
+            print("✅ [ROUND] RoundStart подключён")
+
+            -- ФИКС: конец раунда — гасим noclip. Раньше isRoundActive оставался
+            -- true в лобби и персонаж не мог ходить (PlatformStand + антиграв)
+            local roundEndFade = gameplay:FindFirstChild("RoundEndFade")
+            if roundEndFade and roundEndFade:IsA("RemoteEvent") then
+                roundEndFade.OnClientEvent:Connect(function()
+                    isRoundActive = false
+                    lastRoundTime = os.clock()
+                    disableNoClip()
+                end)
+                print("✅ [ROUND] RoundEndFade подключён")
+            end
+        else
+            -- ФИКС: fallback больше НЕ одноразовый. Раньше после первой смерти
+            -- цикл завершался и фарм умирал навсегда (до перезахода)
+            print("⚠️ [ROUND] RoundStart не найден — fallback-режим (с переактивацией)")
+            while true do
+                task.wait(3)
+                if isRoundActive then continue end
                 local char = LocalPlayer.Character
-                if char and char:FindFirstChild("HumanoidRootPart") then
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if char and char:FindFirstChild("HumanoidRootPart") and hum and hum.Health > 0 then
                     isRoundActive = true
                     lastRoundTime = os.clock()
                     enableNoClip()
-                    break
                 end
-                task.wait(3)
             end
         end
     end)
@@ -348,9 +424,9 @@ end
 
 LocalPlayer.CharacterAdded:Connect(function(char)
     isRoundActive = false
-    bagHandled = false
+    noMapSince = nil
     lastTarget = nil
-    disableNoClip()
+    disableNoClip() -- также восстанавливает и чистит savedPartStates
     -- Died подключаем СРАЗУ (раньше — через wait(1), смерть терялась)
     local hum = char:WaitForChild("Humanoid", 10)
     if hum then
@@ -360,6 +436,19 @@ LocalPlayer.CharacterAdded:Connect(function(char)
         end)
     end
 end)
+
+-- ФИКС: подключаем Died и к персонажу, который УЖЕ существует на момент запуска
+-- (CharacterAdded на него не срабатывает — смерть первого персонажа терялась)
+do
+    local ch0 = LocalPlayer.Character
+    local hum0 = ch0 and ch0:FindFirstChildOfClass("Humanoid")
+    if hum0 then
+        hum0.Died:Connect(function()
+            isRoundActive = false
+            disableNoClip()
+        end)
+    end
+end
 
 -- ================= 🛠️ ВСПОМОГАТЕЛЬНЫЕ =================
 local function getHRP()
@@ -377,7 +466,50 @@ local function getBagCoins()
     if obj then obj = obj:FindFirstChild("Coins") end
     if not obj then return 0 end
     local text = obj:IsA("TextLabel") and obj.Text or ""
-    return tonumber(string.match(text, "%d+")) or 0
+    text = text:gsub("[,%s]", "") -- ФИКС: "1,234" раньше читалось как 1
+    return tonumber(text:match("%d+")) or 0
+end
+
+-- 🍬 Конфеты (Halloween 2026): CurrencyName = "Candies2026"
+-- Дамп показывает мешок: MainGUI.Game.CoinBags.Container.Candy [Frame]
+-- (BagName = "Coin Bag"). Добавлен и Lobby-путь как запасной.
+local function getCandies()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return 0 end
+    local function sf(p, n) return p and p:FindFirstChild(n) end
+    local paths = {
+        { "MainGUI", "Game",  "CoinBags", "Container", "Candy" },
+        { "MainGUI", "Lobby", "Dock", "CoinBags", "Container", "Candy" },
+    }
+    for _, path in ipairs(paths) do
+        local node = playerGui
+        for _, name in ipairs(path) do
+            node = sf(node, name)
+        end
+        local frame = node and node:FindFirstChild("CurrencyFrame")
+        if frame then
+            -- сначала точная структура (как у монет: CurrencyFrame.Icon.<TextLabel>),
+            -- затем — любой TextLabel с цифрами внутри CurrencyFrame
+            local labels = {}
+            local icon = frame:FindFirstChild("Icon")
+            if icon then
+                for _, d in ipairs(icon:GetChildren()) do
+                    if d:IsA("TextLabel") then table.insert(labels, d) end
+                end
+            end
+            if #labels == 0 then
+                for _, d in ipairs(frame:GetDescendants()) do
+                    if d:IsA("TextLabel") then table.insert(labels, d) end
+                end
+            end
+            for _, label in ipairs(labels) do
+                local text = (label.Text or ""):gsub("[,%s]", "")
+                local num = tonumber(text:match("%d+"))
+                if num then return num end
+            end
+        end
+    end
+    return 0
 end
 
 -- ================= 💀 РЕСПАВН =================
@@ -386,44 +518,49 @@ local function forceRespawn()
     isRespawning = true
     print("💀 Запуск респавна...")
 
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if not char or not hum then
-        print("❌ Нет персонажа/Humanoid!")
-        isRespawning = false
-        return
-    end
-
-    if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
-    isMoving = false
-    lastTarget = nil
-
-    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
-    pcall(function() hum.Health = 0 end)
-
-    print("⏳ Ожидание респавна (" .. SETTINGS.SpawnWaitTime .. " сек)...")
-    task.wait(SETTINGS.SpawnWaitTime)
-
-    local newChar = LocalPlayer.Character
-    if newChar and newChar ~= char then
-        print("✅ Новый персонаж появился!")
-        if newChar:WaitForChild("HumanoidRootPart", 5) then
-            enableNoClip()
+    -- ФИКС: тело в pcall — раньше любая ошибка здесь оставляла
+    -- isRespawning = true навсегда и респавн больше никогда не срабатывал
+    local ok, err = pcall(function()
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not char or not hum then
+            print("❌ Нет персонажа/Humanoid!")
+            return
         end
-    else
-        print("⚠️ Персонаж не изменился, пробую Destroy...")
-        pcall(function() char:Destroy() end)
-        task.wait(2)
-        local retryChar = LocalPlayer.Character
-        if retryChar and retryChar:WaitForChild("HumanoidRootPart", 5) then
-            enableNoClip()
+
+        if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
+        isMoving = false
+        lastTarget = nil
+
+        pcall(function() hum.Health = 0 end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+
+        print("⏳ Ожидание респавна (" .. tostring(SETTINGS.SpawnWaitTime) .. " сек)...")
+        task.wait(SETTINGS.SpawnWaitTime)
+
+        local newChar = LocalPlayer.Character
+        if newChar and newChar ~= char then
+            print("✅ Новый персонаж появился!")
+            if newChar:WaitForChild("HumanoidRootPart", 5) then
+                enableNoClip()
+            end
+        else
+            print("⚠️ Персонаж не изменился, пробую Destroy...")
+            pcall(function() char:Destroy() end)
+            task.wait(2)
+            local retryChar = LocalPlayer.Character
+            if retryChar and retryChar:WaitForChild("HumanoidRootPart", 5) then
+                enableNoClip()
+            end
         end
+    end)
+    if not ok then
+        warn("⚠️ [RESPAWN] Ошибка: " .. tostring(err))
     end
 
     isRespawning = false
     print("✅ Респавн завершён")
 end
-
 -- ================= 🪙 ИГНОР МОНЕТ =================
 local function isCollected(coin)
     local now = tick()
@@ -475,23 +612,57 @@ end
 -- ================= 📦 АВТО-КЕЙСЫ (отдельный поток, ремоуты лениво) =================
 task.spawn(function()
     print("🔥 [CRATE] Auto Opener запущен (жду Remotes.Shop...)")
-    local remotes = ReplicatedStorage:WaitForChild("Remotes")
-    local Shop = remotes:WaitForChild("Shop")
-    local OpenCrate = Shop:WaitForChild("OpenCrate")
-    local BoxController = Shop:WaitForChild("BoxController")
+    math.randomseed(math.floor(tick() * 1000) % 2147483647)
+
+    -- ФИКС: таймауты у WaitForChild — если путей нет, поток выйдет с warn'ом,
+    -- а не зависнет молча навсегда (как в v3)
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 120)
+    if not remotes then
+        warn("⚠️ [CRATE] ReplicatedStorage.Remotes не найден — автокейсы отключены")
+        return
+    end
+    local Shop = remotes:WaitForChild("Shop", 120)
+    if not Shop then
+        warn("⚠️ [CRATE] Remotes.Shop не найден — автокейсы отключены")
+        return
+    end
+    local OpenCrate = Shop:WaitForChild("OpenCrate", 120)
+    local BoxController = Shop:WaitForChild("BoxController", 120)
+    if not OpenCrate or not BoxController then
+        warn("⚠️ [CRATE] OpenCrate/BoxController не найдены — автокейсы отключены")
+        return
+    end
 
     if not OpenCrate:IsA("RemoteFunction") then
         warn("⚠️ [CRATE] OpenCrate — это " .. OpenCrate.ClassName .. ", InvokeServer может не работать!")
     end
 
+    -- Каждый бокс — со своим списком валют (порядок = приоритет траты)
     local boxes = {
-        "KnifeBox1", "KnifeBox2", "KnifeBox3", "KnifeBox4", "KnifeBox5",
-        "GunBox1", "GunBox3"
+        { id = "KnifeBox1", currencies = { "Coins", "Gems", "Key" } },
+        { id = "KnifeBox2", currencies = { "Coins", "Gems", "Key" } },
+        { id = "KnifeBox3", currencies = { "Coins", "Gems", "Key" } },
+        { id = "KnifeBox4", currencies = { "Coins", "Gems", "Key" } },
+        { id = "KnifeBox5", currencies = { "Coins", "Gems", "Key" } },
+        { id = "GunBox1",   currencies = { "Coins", "Gems", "Key" } },
+        { id = "GunBox3",   currencies = { "Coins", "Gems", "Key" } },
     }
-    local currencies = {"Coins", "Gems", "Key"}
+
+    -- 🎃 ХЕЛЛОУИН 2026 (из дампа игры):
+    -- ReplicatedStorage.Remotes.Events.Halloween2026Remotes / GetEvents:
+    --   Items.MysteryBox.Halloween2026Box:
+    --     Type = "MysteryBox"  (тот же тип, что и у обычных боксов!)
+    --     Price = { Candies2026 = 600, HalloweenKey2026 = 1 }
+    --     Contents: 10 предметов, Godly = "Embersickle"
+    if SETTINGS.AutoOpenHalloween then
+        table.insert(boxes, { id = "Halloween2026Box", currencies = SETTINGS.HalloweenCurrencies })
+        print("🎃 [CRATE] Halloween2026Box в ротации (валюты: "
+            .. table.concat(SETTINGS.HalloweenCurrencies, " → ") .. ")")
+    end
 
     local function fireBoxController(data)
-        -- у RemoteEvent нет :Fire — раньше был молчаливый фейл в pcall
+        -- Дамп подтвердил: BoxController — BindableEvent → нужен ЛОКАЛЬНЫЙ :Fire()
+        -- (он запускает анимацию вскрытия ReplicatedStorage.Modules.BoxModule.Unboxing)
         if BoxController:IsA("RemoteEvent") then
             BoxController:FireServer(data)
         elseif BoxController:IsA("RemoteFunction") then
@@ -501,18 +672,17 @@ task.spawn(function()
         end
     end
 
-    local function openRandomCrate()
-        local boxId = boxes[math.random(1, #boxes)]
-        for _, currency in ipairs(currencies) do
+    local function openBox(box)
+        for _, currency in ipairs(box.currencies) do
             local ok, result = pcall(function()
-                return OpenCrate:InvokeServer(boxId, "MysteryBox", currency)
+                return OpenCrate:InvokeServer(box.id, "MysteryBox", currency)
             end)
-            -- print("[CRATE DEBUG]", boxId, currency, ok, result) -- раскомментируй для отладки
+            -- print("[CRATE DEBUG]", box.id, currency, ok, result) -- раскомментируй для отладки
             if ok and result then
                 pcall(function()
-                    fireBoxController({{MysteryBoxId = boxId, RewardedItemId = result}})
+                    fireBoxController({ { MysteryBoxId = box.id, RewardedItemId = result } })
                 end)
-                print("✅ [CRATE]", boxId, "|", currency, "| Выпало:", result)
+                print("✅ [CRATE]", box.id, "|", currency, "| Выпало:", tostring(result))
                 return true
             end
         end
@@ -521,17 +691,18 @@ task.spawn(function()
 
     local openedCount, failedCount, waitingForMoney = 0, 0, false
     while SETTINGS.Enabled do
-        if openRandomCrate() then
+        local box = boxes[math.random(1, #boxes)]
+        if openBox(box) then
             if waitingForMoney then
                 print("💰 [CRATE] Деньги появились!")
                 waitingForMoney = false
             end
             openedCount = openedCount + 1
-            print(" [CRATE] Открыто: " .. openedCount .. " | Ошибок: " .. failedCount)
+            print("📦 [CRATE] Открыто: " .. openedCount .. " | Ошибок: " .. failedCount)
             task.wait(2.5)
         else
             if not waitingForMoney then
-                print("⏳ [CRATE] Нет денег/ключей. Ожидаю...")
+                print("⏳ [CRATE] Не хватает валюты (конфет: " .. getCandies() .. "). Ожидаю...")
                 waitingForMoney = true
             end
             failedCount = failedCount + 1
@@ -559,11 +730,16 @@ task.spawn(function()
     print("✅ AUTO FARM + AUTO CRATE ACTIVE")
     print("   Speed: " .. SETTINGS.MoveSpeed .. " | YOffset: " .. SETTINGS.YOffset)
     print("   💀 Респавн: при " .. SETTINGS.MaxBagCoins .. " монетах")
+    if SETTINGS.AutoOpenHalloween then
+        print("   🎃 Хеллоуин-кейс: Halloween2026Box (валюты: "
+            .. table.concat(SETTINGS.HalloweenCurrencies, " → ") .. ")")
+    end
     print("   🔌 Реконнект при ошибках: " .. table.concat(codes, ", ") .. " | ретрай: " .. SETTINGS.ReconnectRetry .. " сек")
     print("")
 
     while SETTINGS.Enabled do
-        pcall(function()
+        -- ФИКС: ошибки больше не глотаются молча — иначе фарм умирает без диагностики
+        local okLoop, errLoop = pcall(function()
             if not isRoundActive then task.wait(1) return end
 
             local hrp = getHRP()
@@ -580,27 +756,46 @@ task.spawn(function()
             local currentBag = getBagCoins()
 
             if currentBag >= SETTINGS.MaxBagCoins then
-                -- фикс: раньше при несбросившемся мешке — бесконечный цикл смертей
-                if not bagHandled then
+                -- ФИКС цикла смертей: респавн только если мешок был НИЖЕ лимита.
+                -- Раньше bagHandled сбрасывался в CharacterAdded/RoundStart, и если
+                -- мешок не сбрасывался — смерти шли по кругу каждый раунд
+                if bagBelowLimit and SETTINGS.AutoRespawn and not isRespawning then
                     print(" [FARM] МЕШОК ПОЛНЫЙ: " .. currentBag .. "/" .. SETTINGS.MaxBagCoins)
                     if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
                     isMoving = false
-                    bagHandled = true
-                    if SETTINGS.AutoRespawn and not isRespawning then
-                        forceRespawn()
-                    end
+                    bagBelowLimit = false
+                    forceRespawn()
                 end
                 task.wait(1)
                 return
             else
-                bagHandled = false
+                bagBelowLimit = true
             end
 
             local map
             for _, obj in ipairs(workspace:GetChildren()) do
                 if obj:FindFirstChild("CoinContainer") then map = obj; break end
             end
-            if not map then task.wait(SETTINGS.LoopDelay) return end
+
+            if not map then
+                -- ФИКС: карты нет > 25 сек = раунд кончился (лобби).
+                -- Иначе isRoundActive залипал в true и noclip не выключался
+                if isRoundActive then
+                    if not noMapSince then noMapSince = os.clock() end
+                    if os.clock() - noMapSince > 25 then
+                        isRoundActive = false
+                        noMapSince = nil
+                        lastRoundTime = os.clock()
+                        disableNoClip()
+                        print("🏁 [FARM] Раунд закончился (карта пропала) — noclip выключен")
+                    end
+                else
+                    noMapSince = nil
+                end
+                task.wait(SETTINGS.LoopDelay)
+                return
+            end
+            noMapSince = nil
 
             local coin, dist = getNearestCoin(map, hrp)
             if not coin then lastTarget = nil; task.wait(SETTINGS.LoopDelay) return end
@@ -608,6 +803,12 @@ task.spawn(function()
             local targetPos = Vector3.new(coin.Position.X, coin.Position.Y + SETTINGS.YOffset, coin.Position.Z)
 
             if dist <= SETTINGS.CollectionRadius then
+                -- ФИКС зависания над монетой: если остановились в радиусе, но не
+                -- вплотную — дотягиваемся точно до монеты, иначе Touched может
+                -- не сработать и скрипт вечно "маркировал" одну и ту же монету
+                if dist > 1.5 then
+                    tweenToTarget(hrp, coin.Position)
+                end
                 markCollected(coin)
                 lastTarget = nil
                 coinCounter = coinCounter + 1
@@ -622,6 +823,9 @@ task.spawn(function()
                 tweenToTarget(hrp, targetPos)
             end
         end)
+        if not okLoop then
+            warn("⚠️ [FARM LOOP] " .. tostring(errLoop))
+        end
 
         task.wait(SETTINGS.LoopDelay)
     end
