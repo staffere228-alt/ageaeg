@@ -1,32 +1,44 @@
 --[[
-Auto Farm + Auto Crate - MM2 | FINAL BUILD v4 (Halloween '26)
-- Скорость 20 studs/sec (постоянная)
-- АВТО-КЕЙСЫ: отдельный поток, ремоуты ищутся лениво (не блокируют скрипт)
-    🎃 НОВОЕ: Halloween2026Box — 600 Candies2026 ИЛИ 1 HalloweenKey2026
-    (имена подтверждены дампом игры: Remotes.Shop.OpenCrate [RemoteFunction],
-     Remotes.Shop.BoxController [BindableEvent])
+Auto Farm + Auto Crate - MM2 | FINAL BUILD v6 (Halloween '26)
+🆕 v6 — ФИКСЫ АФК и ЗАДЕРЖЕК поверх v5-разноброса:
+  ⚡ Скорость 20 → 65 studs/s: при 20 полёт до каждой конфетки занимал 2-4 сек —
+    это и была «жёсткая задержка между конфетками»
+  🛠 ГЛАВНЫЙ ФИКС АФК: в v5 бот замирал ВРЯДОМ с монетой. Твин доводил до
+    сдвинутой точки прилёта (2-3.6 стада от монеты), а повторный дотяг
+    блокировался проверкой «lastTarget == coin» → бот висел в 2-3 студах
+    от конфетки вечно (пока её не заберёт другой бот). Теперь: твин доиграл —
+    летим ТОЧНО в монету, без мёртвой зоны.
+  🛠 ФИКС АФК №2: CharacterAdded больше НЕ сбрасывает isRoundActive и не гасит
+    noclip — раньше после КАЖДОГО респавна (авто-смерть при полном мешке,
+    спавн в раунде ПОСЛЕ RoundStart) бот стоял до конца раунда
+  🛠 ФИКС АФК №3: поиск карты на 2 уровня вглубь workspace — если CoinContainer
+    вложен глубже (ивентовые карты), фарм молчал весь раунд
+  🛠 ФИКС АФК №4: watchdog застоя (20 сек без полёта/сбора → сброс цели и меток),
+    гард рассинхрона isMoving/твина, форс-респавн при «залипшем» полном мешке
+  🛠 Мгновенный переприцел, если монету забрал ДРУГОЙ БОТ (исчезла из мира) —
+    не летим в пустоту
+  ⚡ Монета помечается собранной только ВПЛОТНУЮ (CollectDistance = 1.5),
+    а не с 4 студов — раньше «бросалась» недособранной и бот возвращался
+  ⚡ MAX_IGNORED 10 → 80 + жёсткий игнор монеты после 3 неудачных заходов
+  ⚡ YOffset -2 → 0, ArrivalSpread 3.0 → 1.6, StartDelayMax 3.0 → 1.5,
+    RandomPickMinDist 45 → 80 (сильнее разноброс)
+  🔀 РАЗНОБОРОС v5 сохранён: случайный (взвешенный) выбор из топ-6 ближайших,
+    персональная скорость, сдвиг точки прилёта, seed на аккаунт
+- АВТО-КЕЙСЫ: отдельный поток, ремоуты лениво (не блокируют скрипт)
+    🎃 Halloween2026Box — 600 Candies2026 ИЛИ 1 HalloweenKey2026
 - РЕСПАВН: Health=0 + ChangeState(Dead) + защита от цикла смертей (bagBelowLimit)
-- ПУТЬ К МОНЕТАМ: MainGUI.Lobby.Dock.CoinBags... (конфеты: MainGUI.Game.CoinBags.Container.Candy)
 - NoClip ULTIMATE + Антигравитация (сила считается от workspace.Gravity)
-- РЕКОННЕКТ при ошибке 279 (+ 277/268/267) с ретраями каждые 5 сек
-- Watchdog: перезаход, если раунда нет N минут (чисто по времени — фикс залипания)
-- v4: хеллоуин-кейс + фиксы из код-ревью (fallback, watchdog, цикл смертей,
-  лог ошибок, восстановление noclip, таймауты WaitForChild, GuiInset и др.)
-- v5: 🎲 РАЗНОБОРОС — боты больше не летят цепочкой друг за другом:
-  * выбор монеты СЛУЧАЙНО из нескольких ближайших (взвешенно, ближние чаще)
-  * случайный сдвиг точки прилёта вокруг монеты (съезжаются с разных сторон)
-  * персональная скорость аккаунта (MoveSpeed ± SpeedJitter) — обгоняют друг друга
-  * случайная задержка старта и джиттер цикла — рассинхрон одновременных ботов
-  * сид ГСЧ на аккаунт (UserId + время) — боты «мыслят» по-разному
-  + фиксы из ревью: дотяг до монеты не перебивается, парсинг 1.2K/1,234,
-  второй путь мешка (Lobby+Game), выход из мёртвого сервера при реконнекте,
-  защита от двойного запуска, клик по кнопке устройства, активация в середине
-  раунда, warn при застое полного мешка, RoundEndFade через WaitForChild
+- РЕКОННЕКТ при ошибке 279 (+ 277/268/267), 5 попыток в тот же сервер,
+  потом случайный сервер
 ]]
 
 -- 🛡️ ФИКС: защита от повторного запуска (queue_on_teleport + ручной запуск
--- = два экземпляра фарма = двойные твины и двойной расход валюты)
-if _G.__MM2_AUTOFARM then return end
+-- = два экземпляра фарма = двойные твины и двойной расход валюты).
+-- Перезапустить скрипт = перезайти в игру, либо выполни: _G.__MM2_AUTOFARM = nil
+if _G.__MM2_AUTOFARM then
+    warn("⚠️ MM2 Auto Farm уже запущен — повторный запуск пропущен")
+    return
+end
 _G.__MM2_AUTOFARM = true
 
 -- ================= 🛠️ СЕРВИСЫ =================
@@ -56,24 +68,28 @@ end
 -- ================= ⚙️ НАСТРОЙКИ =================
 local SETTINGS = {
     Enabled = true,
-    MoveSpeed = 20,
-    CollectionRadius = 4.0,
+    MoveSpeed = 65,          -- ⚡ было 20: полёт к каждой конфетке занимал 2-4 сек (главная «задержка»)
+    CollectDistance = 1.5,   -- ⚡ ближе этого расстояния монета считается собранной.
+                             --   Раньше метили с 4.0 — монеты «бросались» недособранными
     LoopDelay = 0.1,
     MaxBagCoins = 40,
     AutoRespawn = true,
     SpawnWaitTime = 3.0,
-    YOffset = -2,
+    YOffset = 0,             -- ⚡ было -2: летим точно В монету (один твин вместо двух)
     ReconnectDelay = 2,        -- пауза перед первой попыткой перезахода
     ReconnectRetry = 5,        -- ретрай телепорта каждые 5 сек (как было)
     IdleReconnectMinutes = 15, -- перезаход, если раунда нет N минут (0 = выкл)
 
+    -- 🛠 АНТИ-АФК:
+    StuckTimeout = 20,       -- сек без нового полёта/сбора → сброс цели и меток, переприцел
+
     -- 🎲 РАЗНОБОРОС (главные ручки — крути под себя):
     RandomPickTop = 6,       -- из скольких БЛИЖАЙШИХ монет выбирать случайно (взвешенно: ближние чаще).
                              --   1 = как в v4 (строго ближайшая); 0 = совсем случайная любая монета на карте
-    RandomPickMinDist = 45,  -- монеты дальше этого расстояния (стады) не рассматриваем, если есть ближе (0 = выкл)
-    ArrivalSpread = 3.0,     -- случайный сдвиг точки прилёта вокруг монеты (стады) — подлетают с разных сторон
-    SpeedJitter = 2.5,       -- персональная скорость аккаунта: MoveSpeed ± это значение (0 = все едут одинаково)
-    StartDelayMax = 3.0,     -- случайная задержка старта фарма 0..N сек (рассинхрон ботов, запущенных одновременно)
+    RandomPickMinDist = 80,  -- ⚡ было 45: шире область выбора → боты сильнее расходятся (0 = выкл)
+    ArrivalSpread = 1.6,     -- ⚡ было 3.0: сдвиг точки прилёта (стады); дотяг в монету всё равно точный
+    SpeedJitter = 6,         -- персональная скорость аккаунта: MoveSpeed ± это значение (0 = все едут одинаково)
+    StartDelayMax = 1.5,     -- ⚡ было 3.0: случайная задержка старта 0..N сек (рассинхрон одновременных ботов)
     LoopJitter = 0.08,       -- случайная прибавка к LoopDelay каждый цикл (боты не дышат в такт)
 
     -- 🎃 ХЕЛЛОУИН 2026 (по дампу игры):
@@ -95,8 +111,9 @@ local RECONNECT_CODES = {
     ["267"] = true, -- Kicked from game
 }
 
-local MAX_IGNORED = 10
+local MAX_IGNORED = 80        -- ⚡ было 10: на карте 40-100 монет, свежие метки вытеснялись
 local IGNORE_DUR = 3.0
+local HARD_IGNORE_TRIES = 3   -- монета, к которой 3 раза прилетели впустую — игнор до конца раунда
 local isReconnecting = false
 local isRespawning = false
 
@@ -110,10 +127,10 @@ local antiGravForce = nil
 local collisionGroupReady = false
 local bagBelowLimit = false -- ФИКС цикла смертей: true, когда видели мешок НИЖЕ лимита
 local coinCounter = 0
-local lastTarget = nil
-local committedCoin = nil  -- 🎲 зафиксированная цель: выбирается случайно ОДИН раз, не пересматривается каждый цикл
-local bagStallSince = nil  -- с какого момента мешок стоит полным (для warn'а о застое)
+local lastTarget = nil     -- 🎲 стики-цель: выбирается случайно ОДИН раз и держится, пока жива
+local bagStallSince = nil  -- с какого момента мешок стоит полным (анти-залипание)
 local lastRoundTime = os.clock()
+local lastActivity = os.clock() -- 🛠 анти-застой: время последнего полёта/сбора
 
 -- 🎲 Персональная скорость этого аккаунта: боты едут чуть по-разному,
 -- обгоняют друг друга и не идут идеальным строем
@@ -440,10 +457,11 @@ local function setupRoundDetection()
                 isRoundActive = true
                 lastRoundTime = os.clock() -- для idle-watchdog
                 bagBelowLimit = false      -- ФИКС цикла смертей: реарм на новом раунде
-                lastTarget = nil
-                committedCoin = nil        -- 🎲 новая цель выбирается заново
+                bagStallSince = nil
+                lastTarget = nil           -- 🎲 новая случайная цель
                 collectedCoins = {}
                 noMapSince = nil
+                lastActivity = os.clock()
                 enableNoClip()
             end)
             print("✅ [ROUND] RoundStart подключён")
@@ -472,6 +490,9 @@ local function setupRoundDetection()
                 if char and char:FindFirstChild("HumanoidRootPart") and hum and hum.Health > 0 then
                     isRoundActive = true
                     lastRoundTime = os.clock()
+                    lastActivity = os.clock()
+                    lastTarget = nil
+                    collectedCoins = {}
                     enableNoClip()
                 end
             end
@@ -479,20 +500,31 @@ local function setupRoundDetection()
     end)
 end
 
+-- 🛠 ГЛАВНЫЙ ФИКС АФК №2: раньше здесь сбрасывался isRoundActive и выключался
+-- noclip. Но респавн случается НЕ только между раундами: авто-смерть при полном
+-- мешке, спавн в начале раунда ПОСЛЕ события RoundStart — и бот молча стоял
+-- до следующего раунда. Теперь раунд остаётся активным, noclip включается
+-- заново на новом персонаже, фарм продолжается с того же места.
 LocalPlayer.CharacterAdded:Connect(function(char)
-    isRoundActive = false
     noMapSince = nil
     lastTarget = nil
-    committedCoin = nil -- 🎲 сброс цели при новом персонаже
-    disableNoClip() -- также восстанавливает и чистит savedPartStates
-    -- Died подключаем СРАЗУ (раньше — через wait(1), смерть терялась)
-    local hum = char:WaitForChild("Humanoid", 10)
-    if hum then
-        hum.Died:Connect(function()
-            isRoundActive = false
-            disableNoClip()
-        end)
-    end
+    lastActivity = os.clock()
+    disableNoClip() -- откат состояний СТАРОГО персонажа + очистка savedPartStates
+    task.spawn(function()
+        -- Died подключаем СРАЗУ (раньше — через wait(1), смерть терялась)
+        local hum = char:WaitForChild("Humanoid", 10)
+        if hum then
+            hum.Died:Connect(function()
+                isRoundActive = false
+                disableNoClip()
+            end)
+        end
+        local hrp = char:WaitForChild("HumanoidRootPart", 10)
+        if hum and hrp and hum.Health > 0 and isRoundActive then
+            task.wait(0.2)
+            enableNoClip()
+        end
+    end)
 end)
 
 -- ФИКС: подключаем Died и к персонажу, который УЖЕ существует на момент запуска
@@ -649,13 +681,25 @@ end
 local function isCollected(coin)
     local now = tick()
     for _, d in ipairs(collectedCoins) do
-        if d.coin == coin and now < d.time + IGNORE_DUR then return true end
+        if d.coin == coin then
+            -- «мёртвая» монета: 3 раза прилетали впустую — игнорим до конца раунда
+            if (d.tries or 1) >= HARD_IGNORE_TRIES then return true end
+            return now < d.time + IGNORE_DUR
+        end
     end
     return false
 end
 
 local function markCollected(coin)
-    table.insert(collectedCoins, {coin = coin, time = tick()})
+    local now = tick()
+    for _, d in ipairs(collectedCoins) do
+        if d.coin == coin then
+            d.tries = (d.tries or 1) + 1
+            d.time = now
+            return
+        end
+    end
+    table.insert(collectedCoins, {coin = coin, time = now, tries = 1})
     if #collectedCoins > MAX_IGNORED then table.remove(collectedCoins, 1) end
 end
 
@@ -666,16 +710,30 @@ end
 --   RandomPickTop = 1 → старое поведение (строго ближайшая)
 --   RandomPickTop = 0 → полностью случайная любая монета на карте
 local function getRandomCoin(container, hrp)
-    if not container or not hrp then return nil, math.huge end
+    if not container or not hrp then return nil end
     local candidates = {}
+    local matched = false
     for _, part in ipairs(container:GetChildren()) do
         if not part:IsA("BasePart") then continue end
-        if not part.Name:lower():find("coin") then continue end
-        if isCollected(part) then continue end
-        local d = (part.Position - hrp.Position).Magnitude
-        table.insert(candidates, { part = part, dist = d })
+        local n = part.Name:lower()
+        -- 🛠 ФИКС: ивентовые collectibles могли называться Candy/Sweet — раньше
+        -- на такой карте не находилось НИ ОДНОЙ цели и бот стоял весь раунд
+        if n:find("coin") or n:find("candy") or n:find("candie") or n:find("sweet") then
+            matched = true
+            if not isCollected(part) then
+                table.insert(candidates, { part = part, dist = (part.Position - hrp.Position).Magnitude })
+            end
+        end
     end
-    if #candidates == 0 then return nil, math.huge end
+    -- fallback: имена не подошли вообще — берём все детали контейнера
+    if not matched then
+        for _, part in ipairs(container:GetChildren()) do
+            if part:IsA("BasePart") and not isCollected(part) then
+                table.insert(candidates, { part = part, dist = (part.Position - hrp.Position).Magnitude })
+            end
+        end
+    end
+    if #candidates == 0 then return nil end
     table.sort(candidates, function(a, b) return a.dist < b.dist end)
 
     -- мягкий лимит дальности: если есть монеты ближе RandomPickMinDist,
@@ -690,10 +748,9 @@ local function getRandomCoin(container, hrp)
 
     local n = #candidates
     local top = SETTINGS.RandomPickTop
-    if top == 1 then return candidates[1].part, candidates[1].dist end
+    if top == 1 then return candidates[1].part end
     if top <= 0 then
-        local c = candidates[math.random(1, n)]
-        return c.part, c.dist
+        return candidates[math.random(1, n)].part
     end
 
     -- взвешенный выбор из top ближайших: вес ближней максимальный
@@ -706,7 +763,7 @@ local function getRandomCoin(container, hrp)
         acc = acc + (k - i + 1)
         if roll <= acc then chosen = candidates[i]; break end
     end
-    return chosen.part, chosen.dist
+    return chosen.part
 end
 
 -- 🎲 Случайный сдвиг точки прилёта вокруг монеты (равномерно по кругу):
@@ -856,6 +913,24 @@ task.spawn(function()
     end
 end)
 
+-- ================= 🗺️ ПОИСК КАРТЫ =================
+-- 🛠 ФИКС АФК №3: раньше CoinContainer искали только у ПРЯМЫХ детей workspace.
+-- Если карта вложена в папку/модель (бывает на ивентовых картах) — фарм молчал
+-- весь раунд: бот просто стоял, пока карта не сменится.
+local function findMap()
+    for _, obj in ipairs(workspace:GetChildren()) do
+        local c = obj:FindFirstChild("CoinContainer")
+        if c then return obj, c end
+    end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        for _, sub in ipairs(obj:GetChildren()) do
+            local c = sub:FindFirstChild("CoinContainer")
+            if c then return sub, c end
+        end
+    end
+    return nil, nil
+end
+
 -- ================= ГЛАВНЫЙ ЦИКЛ =================
 setupRoundDetection()
 
@@ -881,8 +956,8 @@ end)
 task.spawn(function()
     local codes = {}
     for k in pairs(RECONNECT_CODES) do table.insert(codes, k) end
-    print("✅ AUTO FARM + AUTO CRATE ACTIVE")
-    print("   Speed: " .. SETTINGS.MoveSpeed .. " | YOffset: " .. SETTINGS.YOffset)
+    print("✅ AUTO FARM + AUTO CRATE ACTIVE (v6)")
+    print("   Speed: " .. SETTINGS.MoveSpeed .. "±" .. tostring(SETTINGS.SpeedJitter) .. " | YOffset: " .. SETTINGS.YOffset)
     print("   🎲 Разноброс: топ-" .. tostring(SETTINGS.RandomPickTop)
         .. " ближайших монет | разброс прилёта: " .. tostring(SETTINGS.ArrivalSpread)
         .. " | скорость: " .. SETTINGS.MoveSpeed .. "±" .. tostring(SETTINGS.SpeedJitter))
@@ -897,6 +972,17 @@ task.spawn(function()
     -- 🎲 рассинхрон старта: боты, запущенные одновременно, входят в раунд вразнобой
     if SETTINGS.StartDelayMax and SETTINGS.StartDelayMax > 0 then
         task.wait(math.random() * SETTINGS.StartDelayMax)
+    end
+
+    -- 🎲 старт полёта к цели: точка прилёта чуть сдвинута случайно (с разных сторон)
+    local function startFlightTo(hrp, coin)
+        local off = randomArrivalOffset()
+        tweenToTarget(hrp, Vector3.new(
+            coin.Position.X + off.X,
+            coin.Position.Y + SETTINGS.YOffset,
+            coin.Position.Z + off.Z
+        ))
+        lastActivity = os.clock()
     end
 
     while SETTINGS.Enabled do
@@ -915,6 +1001,15 @@ task.spawn(function()
                 return
             end
 
+            -- 🛠 ГАРД: твин уже не играет, а isMoving ещё true (рассинхрон после
+            -- отмены) — без этого бот мог замереть с isMoving=true навсегда
+            if isMoving then
+                local t = currentTween
+                if not t or t.PlaybackState ~= Enum.PlaybackState.Playing then
+                    isMoving = false
+                end
+            end
+
             local currentBag = getBagCoins()
 
             if currentBag >= SETTINGS.MaxBagCoins then
@@ -923,16 +1018,21 @@ task.spawn(function()
                 -- мешок не сбрасывался — смерти шли по кругу каждый раунд
                 if bagBelowLimit and SETTINGS.AutoRespawn and not isRespawning then
                     print(" [FARM] МЕШОК ПОЛНЫЙ: " .. currentBag .. "/" .. SETTINGS.MaxBagCoins)
-                    if currentTween then pcall(function() currentTween:Cancel() end); currentTween = nil end
+                    if currentTween then pcall(function() currentTween:Cancel() end) end
+                    currentTween = nil
                     isMoving = false
                     bagBelowLimit = false
+                    bagStallSince = nil
                     forceRespawn()
-                end
-                -- ФИКС: не молчим, если мешок не падает ниже лимита (тихий застой)
-                if not bagStallSince then bagStallSince = os.clock() end
-                if os.clock() - bagStallSince > 180 then
-                    warn("⚠️ [FARM] Мешок полон 3+ мин и не сбрасывается — фарм стоит. Проверь, обнуляется ли мешок смертью")
-                    bagStallSince = os.clock()
+                else
+                    -- 🛠 АНТИ-АФК: раньше тут был только warn — если GUI мешка
+                    -- «залип» на полном значении, бот молча стоял вечно
+                    if not bagStallSince then bagStallSince = os.clock() end
+                    if os.clock() - bagStallSince > 90 then
+                        warn("⚠️ [FARM] Мешок полон 90+ сек (залип?) — форсирую респавн")
+                        bagBelowLimit = true -- на следующем тике уйдёт в респавн
+                        bagStallSince = nil
+                    end
                 end
                 task.wait(1)
                 return
@@ -941,11 +1041,7 @@ task.spawn(function()
                 bagBelowLimit = true
             end
 
-            local map, container
-            for _, obj in ipairs(workspace:GetChildren()) do
-                local c = obj:FindFirstChild("CoinContainer")
-                if c then map, container = obj, c; break end
-            end
+            local map, container = findMap()
 
             if not map then
                 -- ФИКС: карты нет > 25 сек = раунд кончился (лобби).
@@ -970,50 +1066,64 @@ task.spawn(function()
             -- посчитается «простоем» и вызовет ложный перезаход
             if isRoundActive then lastRoundTime = os.clock() end
 
-            -- 🎲 Держим ранее выбранную цель (иначе рандом каждый цикл заставит
-            -- бота метаться между монетами). НОВАЯ цель выбирается СЛУЧАЙНО
-            -- только когда старой больше нет: её забрали или она собрана.
-            local coin, dist
-            if committedCoin and committedCoin.Parent == container and not isCollected(committedCoin) then
-                coin = committedCoin
-                dist = (coin.Position - hrp.Position).Magnitude
-            else
-                coin, dist = getRandomCoin(container, hrp)
-                committedCoin = coin
+            -- 🛠 АНТИ-ЗАСТОЙ (watchdog): если давно не было ни нового полёта,
+            -- ни сбора — что-то залипло (метки/цель/твин). Сбрасываем и летим заново.
+            local nowClock = os.clock()
+            if nowClock - lastActivity > SETTINGS.StuckTimeout then
+                warn("⚠️ [FARM] Нет прогресса " .. SETTINGS.StuckTimeout .. " сек — сброс цели и меток, переприцел")
+                collectedCoins = {}
+                lastTarget = nil
+                if currentTween then pcall(function() currentTween:Cancel() end) end
+                currentTween = nil
+                isMoving = false
+                lastActivity = nowClock
             end
-            if not coin then lastTarget = nil; task.wait(SETTINGS.LoopDelay) return end
 
-            if dist <= SETTINGS.CollectionRadius then
-                -- ФИКС зависания над монетой: дотягиваемся точно до монеты.
-                -- ФИКС v5: пока дотяг едет — НЕ маркируем монету и НЕ перебиваем
-                -- его следующей целью (раньше твин отменялся почти всегда)
-                if dist > 1.5 then
-                    if lastTarget ~= coin then
-                        lastTarget = coin
-                        tweenToTarget(hrp, coin.Position)
-                    end
+            -- 🎲 Цель исчезла из мира? Её забрал ДРУГОЙ БОТ или сервер.
+            -- Мгновенно снимаем её с цели — не летим в пустоту.
+            if lastTarget and (not lastTarget.Parent or not lastTarget:IsDescendantOf(workspace)) then
+                lastTarget = nil
+                if currentTween then pcall(function() currentTween:Cancel() end) end
+                currentTween = nil
+                isMoving = false
+            end
+
+            -- 🎲 СТИКИ-ЦЕЛЬ: выбирается СЛУЧАЙНО один раз и держится, пока жива
+            -- (иначе рандом каждый тик заставлял бы метаться между монетами).
+            -- Новая случайная цель — только когда старой больше нет.
+            if not lastTarget then
+                local coin = getRandomCoin(container, hrp)
+                if not coin then
+                    task.wait(SETTINGS.LoopDelay)
                     return
                 end
-                markCollected(coin)
+                lastTarget = coin
+                startFlightTo(hrp, coin)
+                return
+            end
+
+            local dist = (lastTarget.Position - hrp.Position).Magnitude
+
+            if dist <= SETTINGS.CollectDistance then
+                -- ⚡ маркируем ТОЛЬКО вплотную (раньше с 4 студов — монета
+                -- «бросалась» недособранной, и бот возвращался за ней = задержки)
+                markCollected(lastTarget)
                 lastTarget = nil
-                committedCoin = nil
                 coinCounter = coinCounter + 1
+                lastActivity = os.clock()
                 if coinCounter % 10 == 0 then
                     print("💰 [FARM] Собрано: " .. coinCounter .. " | Мешок: " .. currentBag .. "/" .. SETTINGS.MaxBagCoins)
                 end
                 return
             end
 
-            if not isMoving or lastTarget ~= coin then
-                lastTarget = coin
-                -- 🎲 точка прилёта чуть сдвинута случайно: подлетаем с разных сторон
-                local off = randomArrivalOffset()
-                local targetPos = Vector3.new(
-                    coin.Position.X + off.X,
-                    coin.Position.Y + SETTINGS.YOffset,
-                    coin.Position.Z + off.Z
-                )
-                tweenToTarget(hrp, targetPos)
+            if not isMoving then
+                -- 🛠 ГЛАВНЫЙ ФИКС АФК: в v5 тут стоял гард «lastTarget ~= coin»,
+                -- который БЛОКИРОВАЛ дотяг, когда твин уже довёл до сдвинутой
+                -- точки прилёта (2-3.6 стада от монеты). Бот замирал рядом с
+                -- конфеткой навсегда. Теперь: твин доиграл — летим ТОЧНО в монету.
+                tweenToTarget(hrp, lastTarget.Position)
+                lastActivity = os.clock()
             end
         end)
         if not okLoop then
